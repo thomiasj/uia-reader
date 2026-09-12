@@ -438,57 +438,174 @@ def _set_cursor_pos(xy):
     ctypes.windll.user32.SetCursorPos(int(xy[0]), int(xy[1]))
 
 
-def _activate_without_mouse(target):
-    """Try every UI Automation pattern that activates a control WITHOUT the real pointer.
+# --- action scope ------------------------------------------------------------------------
+#
+# Reading is safe anywhere; acting is not. Before 2026-09-12 click/type could act in ANY
+# window on the machine, and once clicks stopped moving the real mouse, the user no longer
+# had even that cue that something was happening. So every action is scoped by default to
+# the calling session's own window, with two explicit, separately-named opt-outs:
+#
+#   allow_other_window   -- an ordinary app window (Edge, a settings dialog, ...).
+#   allow_other_session  -- another Claude window. Deliberately stricter: typing into or
+#                           clicking in another session acts with THAT session's
+#                           permissions, not yours -- cross-session permission laundering.
+#                           Send that session a message instead.
 
-    Returns (method, verified) on success, or None if nothing worked. `verified` is True
-    only where the control's own state confirms the action took effect; a pattern that
-    reports success while the state doesn't change is treated as a failure and the next
-    method is tried -- a success return is not evidence the action happened.
-    """
-    settle = 0.08
-
+def _process_exe(pid):
+    import ctypes
+    import ctypes.wintypes as W
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = W.HANDLE
+    h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
     try:
-        target.invoke()
-        return ("invoke", False)  # no generic state to confirm against
+        buf = ctypes.create_unicode_buffer(1024)
+        size = W.DWORD(len(buf))
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+        return ""
+    finally:
+        k32.CloseHandle(h)
+
+
+def _owning_window(target, title):
+    try:
+        top = target.top_level_parent()
+        if top is not None:
+            return top
     except Exception:
         pass
+    return _locate_window(title)
+
+
+def _scope_refusal(target, title, who, allow_other_window, allow_other_session, verb):
+    """Return a refusal message if this action is out of scope, else None."""
+    win = _owning_window(target, title)
+    try:
+        win_title = win.window_text()
+    except Exception:
+        win_title = title
+    if win_title == who:
+        return None  # the caller's own window
+    try:
+        exe = _process_exe(win.element_info.process_id)
+    except Exception:
+        exe = ""
+    if exe == "claude.exe":
+        if allow_other_session:
+            return None
+        return (
+            f"Refused: {win_title!r} is another Claude window, not {who!r}'s own. Nothing was "
+            f"{verb}. Clicking or typing into another session acts with that session's "
+            f"permissions rather than yours -- cross-session permission laundering. Send it a "
+            f"message instead. Only pass allow_other_session=True when the user has asked for "
+            f"that specific action in that specific session."
+        )
+    if allow_other_window:
+        return None
+    return (
+        f"Refused: {win_title!r} is not {who!r}'s own window. Nothing was {verb}. Actions "
+        f"outside the calling session's window need allow_other_window=True -- pass it when "
+        f"the task genuinely requires this window (e.g. focusing a browser tab), so acting "
+        f"elsewhere on the user's machine is always a deliberate choice."
+    )
+
+
+def _activate_without_mouse(target):
+    """Activate a control WITHOUT the real pointer, pressing it AT MOST ONCE.
+
+    Returns (method, verified) once a method has been sent, or None only if NO method could
+    be sent at all. `verified` is True when the control's own state confirmed the change,
+    False when it was sent but the state didn't move (or there is no state to check).
+
+    THE RULE: fall through to the next method only when the current one could not be SENT
+    (the control doesn't support it, so the call raised). Once any method has been sent,
+    stop -- whether or not its effect showed up yet.
+
+    Why, learned the hard way on 2026-09-12: the previous version treated "state didn't
+    change within 80ms" as failure and moved on to the next method. A menu button's
+    Expand() opens the menu asynchronously, so the check missed it, and the cascade then
+    fired DoDefaultAction() into the now-open menu -- a second press. That run was a test
+    against a Claude session's own options menu, which contains Archive, and the session was
+    archived in the same second. The tool also reported "Nothing was clicked". A slow
+    effect is not a missing effect, and a second press is not a retry; it's a different
+    action on a changed screen.
+    """
+    def wait_for(read, before, timeout=1.0):
+        # Poll instead of one short sleep: effects can be asynchronous.
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if read() != before:
+                    return True
+            except Exception:
+                return False
+            time.sleep(0.05)
+        return False
+
+    try:
+        invoke = target.iface_invoke
+    except Exception:
+        invoke = None
+    if invoke is not None:
+        try:
+            invoke.Invoke()
+            return ("invoke", False)  # no generic state to confirm against
+        except Exception:
+            pass  # could not be sent; safe to try the next method
 
     try:
         tg = target.iface_toggle
         before = tg.CurrentToggleState
-        tg.Toggle()
-        time.sleep(settle)
-        if tg.CurrentToggleState != before:
-            return ("toggle", True)
     except Exception:
-        pass
+        tg = None
+    if tg is not None:
+        try:
+            tg.Toggle()
+        except Exception:
+            tg = None  # not sent
+        if tg is not None:
+            return ("toggle", wait_for(lambda: tg.CurrentToggleState, before))
 
     try:
         si = target.iface_selection_item
-        si.Select()
-        time.sleep(settle)
-        if si.CurrentIsSelected:
-            return ("select", True)
+        was = si.CurrentIsSelected
     except Exception:
-        pass
+        si = None
+    if si is not None:
+        try:
+            si.Select()
+        except Exception:
+            si = None
+        if si is not None:
+            return ("select", True if was else wait_for(lambda: si.CurrentIsSelected, False))
 
     try:
         ec = target.iface_expand_collapse
         state = ec.CurrentExpandCollapseState  # 0 collapsed, 1 expanded, 2 partial, 3 leaf
-        if state != 3:
-            (ec.Collapse if state == 1 else ec.Expand)()
-            time.sleep(settle)
-            if ec.CurrentExpandCollapseState != state:
-                return ("collapse" if state == 1 else "expand", True)
     except Exception:
-        pass
+        ec = None
+    if ec is not None and state != 3:
+        opening = state != 1
+        try:
+            (ec.Expand if opening else ec.Collapse)()
+        except Exception:
+            ec = None
+        if ec is not None:
+            return ("expand" if opening else "collapse",
+                    wait_for(lambda: ec.CurrentExpandCollapseState, state))
 
     try:
-        target.iface_legacy_iaccessible.DoDefaultAction()
-        return ("default action", False)
+        la = target.iface_legacy_iaccessible
     except Exception:
-        pass
+        la = None
+    if la is not None:
+        try:
+            la.DoDefaultAction()
+            return ("default action", False)
+        except Exception:
+            pass
 
     return None
 
@@ -503,8 +620,15 @@ def click_element(
     allow_mouse: bool = False,
     show_cursor: bool = True,
     caller: str = None,
+    allow_other_window: bool = False,
+    allow_other_session: bool = False,
 ) -> str:
     """Click (activate) a control by its visible name -- WITHOUT moving the user's mouse.
+
+    SCOPE: by default this only acts in the calling session's OWN window. Another app's
+    window needs allow_other_window=True. Another Claude window needs
+    allow_other_session=True -- deliberately separate, because acting in another session
+    uses that session's permissions (send it a message instead). Refusals click nothing.
 
     This is a real action with real side effects -- it can press Send, Delete, Submit,
     whatever the target actually does. Requires an EXACT name match by default (set
@@ -531,6 +655,11 @@ def click_element(
     label = f"[{target.element_info.control_type}] '{target.element_info.name}'"
     who = _caller_label(caller)
 
+    refusal = _scope_refusal(target, title, who, allow_other_window, allow_other_session,
+                             "clicked")
+    if refusal:
+        return refusal
+
     if show_cursor:
         wait = _show_ghost(target, who)
         if wait:
@@ -539,10 +668,14 @@ def click_element(
     done = _activate_without_mouse(target)
     if done:
         method, verified = done
-        how = ("confirmed by the control's own state" if verified
-               else "sent; this control exposes no state to confirm it against")
-        return (f"Activated {label} via {method} -- your mouse was not touched ({how})."
-                + warning)
+        if verified:
+            return (f"Activated {label} via {method} -- confirmed by the control's own state. "
+                    f"Your mouse was not touched." + warning)
+        return (f"Sent {method} to {label} ONCE, but its effect is NOT confirmed -- the "
+                f"control's state didn't change within a second, or it has no state to check. "
+                f"Your mouse was not touched. Verify with read_window() before assuming it "
+                f"worked, and do NOT simply click again: if the effect was just slow, a second "
+                f"press acts on whatever the screen shows now." + warning)
 
     if not allow_mouse:
         return (
@@ -572,8 +705,15 @@ def type_into_element(
     index: int = None,
     show_cursor: bool = True,
     caller: str = None,
+    allow_other_window: bool = False,
+    allow_other_session: bool = False,
 ) -> str:
     """Type text into an editable control (text box, chat input, etc.) by its name.
+
+    SCOPE: same as click_element -- the calling session's own window by default,
+    allow_other_window=True for another app, allow_other_session=True for another Claude
+    window. Typing into another session's chat box is the sharpest case of acting with
+    permissions that aren't yours; send that session a message instead.
 
     Overwrites any existing content in the field. Same disambiguation rule as
     click_element: an exact name match is required by default, and an ambiguous match
@@ -592,6 +732,11 @@ def type_into_element(
 
     warning = _element_browser_warning(target)
     label = f"[{target.element_info.control_type}] '{target.element_info.name}'"
+
+    refusal = _scope_refusal(target, title, _caller_label(caller), allow_other_window,
+                             allow_other_session, "typed")
+    if refusal:
+        return refusal
 
     if show_cursor:
         wait = _show_ghost(target, _caller_label(caller))

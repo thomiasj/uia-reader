@@ -126,8 +126,9 @@ order, every UI Automation method that acts on a control directly:
 Where a control exposes state, the result is **confirmed against that state**: a toggle must
 actually flip, a menu must actually open, a tab must actually become selected. A method that
 reports success while the state doesn't change is treated as a failure and the next one is
-tried — a success return is not evidence the action happened. Invoke and default action
-expose nothing to confirm against, and the response says so rather than claiming more.
+stopped at, not retried with another method — see *At most one press* below. Invoke and
+default action expose nothing to confirm against, and the response says so rather than
+claiming more.
 
 The real pointer is used **only** with `allow_mouse=True`, and even then it is put back where
 the user left it — including when the click itself fails. Without that flag, a control with
@@ -136,6 +137,45 @@ no cursor-free method is refused and nothing is clicked.
 Before 2026-09-12 this tool tried `invoke()` and then went straight to the real mouse. The
 controls that took the user's cursor that day — Edge tabs, a desktop app's menu button — all
 supported a cursor-free method it simply never tried.
+
+### At most one press
+
+A click is sent **once**. The tool moves on to the next activation method only when the
+current one **could not be sent** (the control doesn't support it). Once any method has been
+sent, it stops — even if the effect hasn't shown up yet — and says plainly whether the
+control's state confirmed it within a second.
+
+This rule exists because the first cursor-free version broke it. It treated "the state didn't
+change within 80ms" as failure and tried the next method. A menu button opens its menu a
+moment *after* `Expand()`, so the check missed it and the tool fired a **second** press — the
+control's default action — into the now-open menu. It then reported "Nothing was clicked."
+That run was a test against the calling session's own options menu, which contains
+**Archive**, and the session was archived in the same second (2026-09-12). A slow effect is
+not a missing effect, and a second press is not a retry: it acts on whatever the screen shows
+*now*.
+
+So an unconfirmed result tells you to check with `read_window()` rather than click again.
+
+### Where a session may act
+
+Reading works in any window. **Clicking and typing are scoped to the calling session's own
+window by default**, with two separate opt-outs:
+
+| flag | allows |
+|---|---|
+| `allow_other_window=True` | an ordinary app window — a browser, a settings dialog |
+| `allow_other_session=True` | **another Claude session's window** |
+
+They are deliberately separate. Clicking or typing into another Claude session acts with
+*that* session's permissions rather than the caller's — a way around the permission decisions
+the user made for each session. The right move is almost always to send that session a
+message instead. `allow_other_window` alone does **not** unlock another Claude window.
+
+A refused action clicks or types nothing, and says why.
+
+**Testing rule, learned the same afternoon:** never exercise click tools against a real menu
+that contains destructive items (Archive, Delete, Send). Reproduce the behaviour with stand-in
+controls instead — they can record every press, which a real menu cannot.
 
 ### The labelled marker
 
