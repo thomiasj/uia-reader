@@ -15,6 +15,7 @@ printed depth, not raw tree depth, so filtered-out wrappers don't produce mislea
 indentation.
 """
 
+import re
 import sys
 
 # Windows console codepages (e.g. cp1252) can't encode characters some apps put in
@@ -53,6 +54,83 @@ MAX_NODES = 8000
 VALUE_BEARING_TYPES = {"Edit", "Document", "ComboBox"}
 
 
+def _norm(s):
+    """Collapse a control name to exactly the form the read tools print.
+
+    Every tool here tells the caller to copy the name it displayed. That only holds if
+    display and matching agree. They didn't: _dump printed names with newlines turned into
+    spaces, while _find_elements matched the raw name -- so a control whose name wraps was
+    shown one way and matchable only another, and an exact-match click on the printed name
+    failed with "No element found". Found 2026-09-11 against Deskflow, whose radio button is
+    really "Use this computer's keyboard and mouse\n(make this computer the server)". The
+    tool was lying about its own output. Both paths now go through this.
+    """
+    return re.sub(r"\s+", " ", (s or "").replace("\n", " ")).strip()
+
+
+# Ordinary window chrome. A tree containing nothing but these describes a window whose
+# real content is not exposed to UI Automation -- which is NOT the same as an empty
+# window, and reads identically to one. Reported 2026-09-11 from real use: ShareMouse's
+# Monitor Manager returned only [Window]/[MenuBar]/Minimize/Maximize/Close while showing
+# a full drag-and-drop display arrangement, and find_in_window returned "no matches" for
+# navigation items plainly visible on screen. An absent signal read as a negative finding
+# is the most expensive mistake this tool can cause, so it now says so out loud.
+_CHROME_TYPES = {"Window", "TitleBar", "MenuBar"}
+_CHROME_NAMES = {"minimize", "maximize", "close", "restore", "system", "application"}
+_LINE_RE = re.compile(r"^\s*\[([A-Za-z]+)\]\s*(.*)$")
+
+# Below this many non-chrome controls, a visually substantial window is almost certainly
+# custom-drawn rather than genuinely empty.
+SPARSE_CONTENT_THRESHOLD = 2
+# Smaller than roughly 200x200 and a window can legitimately hold almost nothing.
+SPARSE_MIN_AREA = 40000
+
+
+def _content_node_count(lines):
+    """Count emitted nodes that aren't ordinary window chrome."""
+    n = 0
+    for line in lines:
+        m = _LINE_RE.match(line)
+        if not m:
+            continue
+        ctrl_type, label = m.group(1), m.group(2).strip()
+        if ctrl_type in _CHROME_TYPES:
+            continue
+        if label.lower() in _CHROME_NAMES:
+            continue
+        n += 1
+    return n
+
+
+def _sparse_tree_note(win, lines):
+    """Flag a window that is visually substantial but exposes essentially nothing."""
+    content = _content_node_count(lines)
+    if content > SPARSE_CONTENT_THRESHOLD:
+        return ""
+    try:
+        rect = win.rectangle()
+        width, height = rect.width(), rect.height()
+    except Exception:
+        return ""
+    if width * height < SPARSE_MIN_AREA:
+        return ""
+    return (
+        f"\n\n[uia-reader note] This window is {width}x{height} but exposed only "
+        f"{content} control(s) beyond window chrome. Read that as \"not exposed to UI "
+        "Automation\", NOT as \"the window is empty\" -- the read succeeded and found "
+        "nothing to report. Custom-drawn/owner-drawn surfaces (canvases, diagram and "
+        "arrangement views, some custom navigation lists) are painted as pixels with no "
+        "UIA representation at all. Fall back to a screenshot, plus zoom for detail, for "
+        "this window. Note one window can mix both: standard controls elsewhere in it may "
+        "still read perfectly, so a sparse result here doesn't condemn the whole app.\n"
+        "Before concluding that, though, READ IT ONCE MORE. A window that normally exposes "
+        "a full tree was observed collapsing to a single node exactly once in testing "
+        "(2026-09-11, not reproducible across four further attempts) -- so a transient "
+        "sparse read is possible, presumably mid-repaint or while the app is busy. A "
+        "second read costs nothing and separates \"never exposed\" from \"not ready yet\"."
+    )
+
+
 def _dump(elem, printed_depth, lines, counter, max_depth):
     if counter[0] >= MAX_NODES:
         return
@@ -60,7 +138,7 @@ def _dump(elem, printed_depth, lines, counter, max_depth):
 
     try:
         info = elem.element_info
-        name = (info.name or "").strip().replace("\n", " ")
+        name = _norm(info.name)
         ctrl_type = info.control_type
     except Exception as e:
         lines.append("  " * printed_depth + f"<error reading element: {e}>")
@@ -69,7 +147,7 @@ def _dump(elem, printed_depth, lines, counter, max_depth):
     value = ""
     if ctrl_type in VALUE_BEARING_TYPES:
         try:
-            value = (elem.window_text() or "").strip().replace("\n", " ")
+            value = _norm(elem.window_text())
         except Exception:
             pass
 
@@ -149,7 +227,7 @@ def read_window(title: str, max_depth: int = 40) -> str:
     counter = [0]
     _dump(win, 0, lines, counter, max_depth)
     result = "\n".join(lines) if lines else "Window found but no readable content (may be empty or unsupported)."
-    return result + _browser_warning(win.window_text())
+    return result + _sparse_tree_note(win, lines) + _browser_warning(win.window_text())
 
 
 def _find_elements(elem, name, control_type, exact_match, results, counter=None):
@@ -165,14 +243,17 @@ def _find_elements(elem, name, control_type, exact_match, results, counter=None)
 
     try:
         info = elem.element_info
-        elem_name = (info.name or "").strip()
+        elem_name = _norm(info.name)
         elem_type = info.control_type
     except Exception:
         return
 
     name_ok = True
     if name is not None:
-        name_ok = (elem_name == name) if exact_match else (name.lower() in elem_name.lower())
+        # Normalise the needle too -- a caller copying a wrapped name out of read_window
+        # pastes the displayed (space-joined) form, and that must match.
+        wanted = _norm(name)
+        name_ok = (elem_name == wanted) if exact_match else (wanted.lower() in elem_name.lower())
     type_ok = control_type is None or elem_type == control_type
 
     if name_ok and type_ok and (name is not None or control_type is not None):
@@ -391,7 +472,7 @@ def find_in_window(title: str, query: str, max_depth: int = 40) -> str:
     q = query.lower()
     matches = [l for l in lines if q in l.lower()]
     result = "\n".join(matches) if matches else f"No matches for {query!r} in window {title!r}."
-    return result + _browser_warning(win.window_text())
+    return result + _sparse_tree_note(win, lines) + _browser_warning(win.window_text())
 
 
 if __name__ == "__main__":

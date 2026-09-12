@@ -120,6 +120,19 @@ depth limit — a real match can legitimately be very deep) to `_find_elements`,
   Electron/Chromium apps (confirmed: CCD itself) expose a rich tree; a poorly-built or
   custom-canvas-rendered app may expose little beyond generic panes, in which case
   screenshots remain the fallback.
+- **An empty tree means "not exposed", not "empty" — and the two look identical.**
+  Custom-drawn/owner-drawn surfaces (canvases, diagram and arrangement views, some custom
+  navigation lists) are painted as pixels with no UI Automation representation at all, so
+  `read_window` succeeds and describes almost nothing, and `find_in_window` returns "no
+  matches" for text that is plainly visible on screen. Reading that as a negative finding
+  is the most expensive mistake this tool can cause, so since 2026-09-11 both tools say so
+  explicitly when a visually substantial window exposes nothing beyond window chrome. One
+  window can mix both kinds: standard controls elsewhere in it may still read perfectly.
+  Read the window twice before concluding — a transient sparse read has been observed once.
+- Control names are whitespace-normalised (newlines collapsed to spaces) for both display
+  and matching, so the name a read tool prints is the name the click/type tools accept.
+  Before 2026-09-11 these disagreed, and a wrapped label like `"...keyboard and
+  mouse\n(make this computer the server)"` displayed one way and matched only another.
 - **No permission tiering.** The built-in computer-use tool restricts what it'll click/
   type per app category (e.g. browsers are click-blocked). This tool has no equivalent
   gating — if it's registered and callable, it can click or type into *any* window on
