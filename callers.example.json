@@ -1,0 +1,10 @@
+{
+  "folders": {
+    "my-web-app": "WEB",
+    "infra-scripts": "OPS"
+  },
+  "colours": {
+    "WEB": "#2f7fe0",
+    "OPS": "#e07b2f"
+  }
+}

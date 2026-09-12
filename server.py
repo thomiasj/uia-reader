@@ -15,8 +15,12 @@ printed depth, not raw tree depth, so filtered-out wrappers don't produce mislea
 indentation.
 """
 
+import json
+import os
 import re
+import subprocess
 import sys
+import time
 
 # Windows console codepages (e.g. cp1252) can't encode characters some apps put in
 # window titles (zero-width spaces, emoji, etc.) -- force UTF-8 so a stray character
@@ -38,7 +42,7 @@ MEANINGFUL_TYPES = {
     "HeaderItem", "Table", "DataGrid", "DataItem", "Document", "Calendar",
 }
 
-# Raised from 3000 -- Refinery found the default was silently insufficient for
+# Raised from 3000 -- real-world use found the default was silently insufficient for
 # Chromium-based browser windows, where the toolbar/tab-strip subtree alone can contain
 # thousands of nodes, exhausting the budget (traversal is depth-first) before ever
 # reaching actual page content as a later sibling. This is a real budget increase, not
@@ -276,7 +280,7 @@ def _browser_warning(win_title):
     ACTIVE in a browser window, with no way to target a specific background tab.
     Reproduced live 2026-08-30 (open tab A, background it, open+activate tab B in the
     same window -- the window's title and UIA content immediately follow tab B, not A)
-    after Refinery hit this for real trying to verify a background tab's state.
+    after this was hit in real use trying to verify a background tab's state.
 
     Not a bug in this server to "fix" -- it's an accurate reflection of what's actually
     on screen, same as a screenshot would show. The real fix is routing browser-tab
@@ -360,6 +364,135 @@ def _resolve_target(title, name, control_type, exact_match, index):
     return matches[0], None
 
 
+# --- labelled ghost cursor ---------------------------------------------------------------
+
+# Optional per-machine label map, kept OUT of the code on purpose: callers.json beside this
+# file maps working-folder names to the short names their windows are titled with (and
+# optional marker colours). It is private configuration -- a list of someone's projects --
+# so it is gitignored in the public repo. Without it, the label is the folder name itself.
+def _load_callers():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "callers.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {k.lower(): v for k, v in (data.get("folders") or {}).items()}
+    except Exception:
+        return {}
+
+
+_CALLER_BY_FOLDER = _load_callers()
+_GHOST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghost_cursor.py")
+_GLIDE_SECONDS = 0.38  # matches the marker's glide, so it arrives before the action happens
+
+
+def _caller_label(caller):
+    if caller:
+        return caller.strip()[:14]
+    folder = os.path.basename(os.getcwd())
+    return (_CALLER_BY_FOLDER.get(folder.lower()) or folder[:14] or "Claude")
+
+
+def _caller_window_point(label):
+    # EXACT title match, deliberately -- substring matching can't address one-letter titles
+    # like "I" or "B" (they match any window containing that letter).
+    try:
+        for w in Desktop(backend="uia").windows():
+            if w.window_text() == label:
+                r = w.rectangle()
+                return (r.left + (r.right - r.left) // 2, r.top + 60)
+    except Exception:
+        pass
+    return None
+
+
+def _show_ghost(target, label):
+    """Launch the marker and return how long to wait for it to arrive (0 if not shown)."""
+    try:
+        r = target.rectangle()
+        tx, ty = r.left + (r.right - r.left) // 2, r.top + (r.bottom - r.top) // 2
+        start = _caller_window_point(label)
+        args = [sys.executable, _GHOST, str(tx), str(ty), label,
+                str(start[0]) if start else "-", str(start[1]) if start else "-", "1800"]
+        # stdout/stderr MUST be detached: this server speaks MCP over stdout, and a child
+        # inheriting it would corrupt every subsequent tool response.
+        subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x08000000 | 0x00000008)  # NO_WINDOW | DETACHED
+        return _GLIDE_SECONDS if start else 0.12
+    except Exception:
+        return 0.0
+
+
+# --- cursor-free activation ---------------------------------------------------------------
+
+def _cursor_pos():
+    import ctypes
+    import ctypes.wintypes as W
+    p = W.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+    return (p.x, p.y)
+
+
+def _set_cursor_pos(xy):
+    import ctypes
+    ctypes.windll.user32.SetCursorPos(int(xy[0]), int(xy[1]))
+
+
+def _activate_without_mouse(target):
+    """Try every UI Automation pattern that activates a control WITHOUT the real pointer.
+
+    Returns (method, verified) on success, or None if nothing worked. `verified` is True
+    only where the control's own state confirms the action took effect; a pattern that
+    reports success while the state doesn't change is treated as a failure and the next
+    method is tried -- a success return is not evidence the action happened.
+    """
+    settle = 0.08
+
+    try:
+        target.invoke()
+        return ("invoke", False)  # no generic state to confirm against
+    except Exception:
+        pass
+
+    try:
+        tg = target.iface_toggle
+        before = tg.CurrentToggleState
+        tg.Toggle()
+        time.sleep(settle)
+        if tg.CurrentToggleState != before:
+            return ("toggle", True)
+    except Exception:
+        pass
+
+    try:
+        si = target.iface_selection_item
+        si.Select()
+        time.sleep(settle)
+        if si.CurrentIsSelected:
+            return ("select", True)
+    except Exception:
+        pass
+
+    try:
+        ec = target.iface_expand_collapse
+        state = ec.CurrentExpandCollapseState  # 0 collapsed, 1 expanded, 2 partial, 3 leaf
+        if state != 3:
+            (ec.Collapse if state == 1 else ec.Expand)()
+            time.sleep(settle)
+            if ec.CurrentExpandCollapseState != state:
+                return ("collapse" if state == 1 else "expand", True)
+    except Exception:
+        pass
+
+    try:
+        target.iface_legacy_iaccessible.DoDefaultAction()
+        return ("default action", False)
+    except Exception:
+        pass
+
+    return None
+
+
 @mcp.tool()
 def click_element(
     title: str,
@@ -367,8 +500,11 @@ def click_element(
     control_type: str = None,
     exact_match: bool = True,
     index: int = None,
+    allow_mouse: bool = False,
+    show_cursor: bool = True,
+    caller: str = None,
 ) -> str:
-    """Click (invoke) a button or other actionable control by its visible name.
+    """Click (activate) a control by its visible name -- WITHOUT moving the user's mouse.
 
     This is a real action with real side effects -- it can press Send, Delete, Submit,
     whatever the target actually does. Requires an EXACT name match by default (set
@@ -377,8 +513,15 @@ def click_element(
     clicked -- the response lists every match with its index so you can retry with
     that index rather than this tool guessing which one you meant.
 
-    Tries UIA's native invoke() first (no cursor movement needed); falls back to a
-    simulated click_input() if the control doesn't support invoke.
+    The user's mouse pointer is theirs. This tries every UI Automation method that
+    activates a control directly -- invoke, toggle, select, expand/collapse, and the
+    control's default action -- and never touches the real pointer unless you pass
+    allow_mouse=True. Even then the pointer is put back where the user left it.
+
+    A labelled marker shows which sibling is acting and where: it starts in the calling
+    session's own window, glides to the target and fades, and cannot be clicked or take
+    focus. `caller` overrides the label (defaults to the session's short name). Pass
+    show_cursor=False to act without it.
     """
     target, err = _resolve_target(title, name, control_type, exact_match, index)
     if err:
@@ -386,17 +529,38 @@ def click_element(
 
     warning = _element_browser_warning(target)
     label = f"[{target.element_info.control_type}] '{target.element_info.name}'"
-    try:
-        target.invoke()
-        return f"Invoked {label}." + warning
-    except Exception:
-        pass
+    who = _caller_label(caller)
+
+    if show_cursor:
+        wait = _show_ghost(target, who)
+        if wait:
+            time.sleep(wait)
+
+    done = _activate_without_mouse(target)
+    if done:
+        method, verified = done
+        how = ("confirmed by the control's own state" if verified
+               else "sent; this control exposes no state to confirm it against")
+        return (f"Activated {label} via {method} -- your mouse was not touched ({how})."
+                + warning)
+
+    if not allow_mouse:
+        return (
+            f"Found {label}, but it supports no cursor-free way to activate it (no invoke, "
+            f"toggle, select, expand/collapse or default action). Nothing was clicked. "
+            f"Re-call with allow_mouse=True to use the user's real mouse pointer -- it will "
+            f"be moved for the click and then put back."
+        ) + warning
+
+    before = _cursor_pos()
     try:
         target.click_input()
-        return f"Clicked (via click_input fallback) {label}." + warning
+        return (f"Clicked {label} with the real mouse (allow_mouse=True); pointer returned "
+                f"to {before}." + warning)
     except Exception as e:
-        return f"Found {label} but failed to click it: {e}"
-
+        return f"Found {label} but failed to click it even with the mouse: {e}"
+    finally:
+        _set_cursor_pos(before)
 
 @mcp.tool()
 def type_into_element(
@@ -406,6 +570,8 @@ def type_into_element(
     control_type: str = "Edit",
     exact_match: bool = True,
     index: int = None,
+    show_cursor: bool = True,
+    caller: str = None,
 ) -> str:
     """Type text into an editable control (text box, chat input, etc.) by its name.
 
@@ -416,6 +582,9 @@ def type_into_element(
     `control_type` defaults to "Edit" since that's what most text inputs report as;
     pass None to search all control types if the target isn't a standard Edit control
     (e.g. a rich-text area often reports as "Document" instead).
+
+    Never uses the mouse. Shows the same labelled marker as click_element so the user can
+    see which sibling is typing where; pass show_cursor=False to skip it.
     """
     target, err = _resolve_target(title, name, control_type, exact_match, index)
     if err:
@@ -423,6 +592,11 @@ def type_into_element(
 
     warning = _element_browser_warning(target)
     label = f"[{target.element_info.control_type}] '{target.element_info.name}'"
+
+    if show_cursor:
+        wait = _show_ghost(target, _caller_label(caller))
+        if wait:
+            time.sleep(wait)
 
     # Prefer atomic, pattern-based writes over simulated keystrokes -- keystroke
     # simulation (type_keys) was found live to occasionally corrupt input (observed:

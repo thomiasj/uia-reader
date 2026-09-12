@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# private per-machine label map -- a list of your own projects
+callers.json

@@ -112,6 +112,55 @@ truncation marker hit either way. Also added the same `MAX_NODES` safety cap (wi
 depth limit — a real match can legitimately be very deep) to `_find_elements`, used by
 `click_element`/`type_into_element`, which had no bound of any kind before this.
 
+## Your mouse stays yours
+
+`click_element` activates controls **without touching the real mouse pointer.** It tries, in
+order, every UI Automation method that acts on a control directly:
+
+1. **invoke** — buttons that support it
+2. **toggle** — checkboxes and toggle buttons
+3. **select** — tabs, radio buttons, list items
+4. **expand / collapse** — menu buttons, combo boxes, tree nodes
+5. **default action** — the control's own "press" through the accessibility layer
+
+Where a control exposes state, the result is **confirmed against that state**: a toggle must
+actually flip, a menu must actually open, a tab must actually become selected. A method that
+reports success while the state doesn't change is treated as a failure and the next one is
+tried — a success return is not evidence the action happened. Invoke and default action
+expose nothing to confirm against, and the response says so rather than claiming more.
+
+The real pointer is used **only** with `allow_mouse=True`, and even then it is put back where
+the user left it — including when the click itself fails. Without that flag, a control with
+no cursor-free method is refused and nothing is clicked.
+
+Before 2026-09-12 this tool tried `invoke()` and then went straight to the real mouse. The
+controls that took the user's cursor that day — Edge tabs, a desktop app's menu button — all
+supported a cursor-free method it simply never tried.
+
+### The labelled marker
+
+Every click and every typing action shows a small marker: an arrow with the calling session's
+name (`WEB`, `OPS`, …) in a stable colour per session. It **starts in that session's own
+window, glides to the target, and fades** — so you can watch *which* session is acting
+*where* without giving up your own cursor.
+
+- **Click-through and focus-free.** It cannot be clicked and never becomes the active window;
+  input passes straight through it.
+- **Truthful timing.** The action waits for the glide to arrive, so the marker never shows
+  something that already happened elsewhere.
+- **Multi-monitor.** Positions use the same physical virtual-desktop coordinates UI Automation
+  reports, so it lands correctly on offset and secondary monitors.
+- **Separate process.** `ghost_cursor.py` runs detached with its output streams closed — this
+  server speaks MCP over stdout, and a child inheriting that stream would corrupt every tool
+  response.
+
+Pass `show_cursor=False` to act without it, or `caller="NAME"` to override the label.
+
+By default the label is the session's working-folder name. To use short names instead, copy
+`callers.example.json` to `callers.json` beside `server.py` and map folder names to labels
+(and optionally colours). `callers.json` is gitignored: it is a list of your own projects,
+which is private configuration, not code.
+
 ## Known limitations
 
 - Windows only (uses `pywinauto`'s UIA backend). No macOS/Linux equivalent yet — would
