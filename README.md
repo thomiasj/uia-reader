@@ -145,16 +145,48 @@ current one **could not be sent** (the control doesn't support it). Once any met
 sent, it stops — even if the effect hasn't shown up yet — and says plainly whether the
 control's state confirmed it within a second.
 
-This rule exists because the first cursor-free version broke it. It treated "the state didn't
-change within 80ms" as failure and tried the next method. A menu button opens its menu a
-moment *after* `Expand()`, so the check missed it and the tool fired a **second** press — the
-control's default action — into the now-open menu. It then reported "Nothing was clicked."
-That run was a test against the calling session's own options menu, which contains
-**Archive**, and the session was archived in the same second (2026-09-12). A slow effect is
-not a missing effect, and a second press is not a retry: it acts on whatever the screen shows
-*now*.
+Two ways a press can look unsent when it wasn't, and the tool stops on both:
+
+- **A slow effect.** A menu button opens its menu a moment *after* `Expand()`. The first
+  cursor-free version gave up on the state check after 80ms and tried the next method.
+- **An error after the call.** An app can act on a press and then fail to answer. A stand-in
+  control that counts presses and then throws was pressed **twice** by an earlier version —
+  invoke, then its default action — which then reported "Nothing was clicked" (2026-09-14).
+  Only a pattern the control doesn't offer at all counts as "not sent" now.
+
+Why this is taken so seriously: on 2026-09-12 the calling session's own options menu, which
+contains **Archive**, was used as a test target, and the session was archived in the same
+second. The explanation first written down — a missed `Expand()` followed by a default action
+fired into the open menu — **turned out to be impossible**: the default-action step of that
+version could never run (see below). What pressed Archive is not established. The rules above
+close every double-press path found since.
+
+A slow effect is not a missing effect, an error is not proof of nothing, and a second press is
+not a retry: it acts on whatever the screen shows *now*.
 
 So an unconfirmed result tells you to check with `read_window()` rather than click again.
+
+### The default action never ran before 2026-09-14
+
+The fifth step looked for `iface_legacy_iaccessible`, an attribute pywinauto 0.6.9 wrappers
+don't have. The error was caught like any unsupported pattern, so the step silently did nothing
+for every control, and the regression test "proving" the old double press gave its fake controls
+that attribute. It now goes through `uia_defines.get_elem_interface(..., "LegacyIAccessible")`.
+Edge's saved tab-group buttons need it: they offer expand/collapse plus a default action
+("Press"), and when one reports itself as a leaf the expand step is skipped.
+
+Tested against a Windows Forms stand-in whose controls count every press in the window title,
+read separately from the tool:
+
+| Case | Result |
+|---|---|
+| Old code, control with only a default action | not reachable, 0 presses |
+| New code, same control | 1 press |
+| Slow control (effect lands 1.5s later) | 1 press, none added afterwards |
+| Empty default action | nothing sent |
+| Normal control via `click_element` | invoke first, 1 press |
+| **Must fail:** control that counts then throws, old code | pressed, reported as nothing sent |
+| Same control, new code | **1 press**, reported as possibly taken effect |
 
 ### Where a session may act
 

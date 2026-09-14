@@ -29,6 +29,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from pywinauto import Desktop
+from pywinauto import uia_defines as uia_defs
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("uia-reader")
@@ -538,20 +539,24 @@ def _activate_without_mouse(target):
 
     Returns (method, verified) once a method has been sent, or None only if NO method could
     be sent at all. `verified` is True when the control's own state confirmed the change,
-    False when it was sent but the state didn't move (or there is no state to check).
+    False when it was sent but the state didn't move, there is no state to check, or the
+    call reported an error.
 
-    THE RULE: fall through to the next method only when the current one could not be SENT
-    (the control doesn't support it, so the call raised). Once any method has been sent,
-    stop -- whether or not its effect showed up yet.
+    THE RULE: move on to the next method only when the current one could not be SENT --
+    the control doesn't offer that pattern, so getting the interface failed. Once a press
+    call has been made, stop, whatever happened next:
 
-    Why, learned the hard way on 2026-09-12: the previous version treated "state didn't
-    change within 80ms" as failure and moved on to the next method. A menu button's
-    Expand() opens the menu asynchronously, so the check missed it, and the cascade then
-    fired DoDefaultAction() into the now-open menu -- a second press. That run was a test
-    against a Claude session's own options menu, which contains Archive, and the session was
-    archived in the same second. The tool also reported "Nothing was clicked". A slow
-    effect is not a missing effect, and a second press is not a retry; it's a different
-    action on a changed screen.
+    - A slow effect is not a missing effect (2026-09-12: the old version gave up on a state
+      check after 80ms and tried the next method).
+    - An error from the press call is not proof it wasn't delivered (2026-09-14): an app can
+      act on the press and then fail to answer. A stand-in that counts and then throws was
+      pressed TWICE by the previous version -- invoke, then its default action -- which then
+      reported "Nothing was clicked".
+
+    A second press is not a retry; it acts on whatever the screen shows now. That matters
+    here because a Claude session was archived at 17:32:46 on 2026-09-12 while this tool
+    was being tested against its options menu (which contains Archive). What exactly pressed
+    Archive is not established -- see the note in the README.
     """
     def wait_for(read, before, timeout=1.0):
         # Poll instead of one short sleep: effects can be asynchronous.
@@ -565,16 +570,20 @@ def _activate_without_mouse(target):
             time.sleep(0.05)
         return False
 
+    def sent_but_errored(method, e):
+        return (f"{method} (the call reported an error after it was made, so it may still have "
+                f"taken effect: {type(e).__name__})", False)
+
     try:
         invoke = target.iface_invoke
     except Exception:
-        invoke = None
+        invoke = None  # not offered: nothing sent
     if invoke is not None:
         try:
             invoke.Invoke()
-            return ("invoke", False)  # no generic state to confirm against
-        except Exception:
-            pass  # could not be sent; safe to try the next method
+        except Exception as e:
+            return sent_but_errored("invoke", e)
+        return ("invoke", False)  # no generic state to confirm against
 
     try:
         tg = target.iface_toggle
@@ -584,10 +593,9 @@ def _activate_without_mouse(target):
     if tg is not None:
         try:
             tg.Toggle()
-        except Exception:
-            tg = None  # not sent
-        if tg is not None:
-            return ("toggle", wait_for(lambda: tg.CurrentToggleState, before))
+        except Exception as e:
+            return sent_but_errored("toggle", e)
+        return ("toggle", wait_for(lambda: tg.CurrentToggleState, before))
 
     try:
         si = target.iface_selection_item
@@ -597,10 +605,9 @@ def _activate_without_mouse(target):
     if si is not None:
         try:
             si.Select()
-        except Exception:
-            si = None
-        if si is not None:
-            return ("select", True if was else wait_for(lambda: si.CurrentIsSelected, False))
+        except Exception as e:
+            return sent_but_errored("select", e)
+        return ("select", True if was else wait_for(lambda: si.CurrentIsSelected, False))
 
     try:
         ec = target.iface_expand_collapse
@@ -609,24 +616,29 @@ def _activate_without_mouse(target):
         ec = None
     if ec is not None and state != 3:
         opening = state != 1
+        method = "expand" if opening else "collapse"
         try:
             (ec.Expand if opening else ec.Collapse)()
-        except Exception:
-            ec = None
-        if ec is not None:
-            return ("expand" if opening else "collapse",
-                    wait_for(lambda: ec.CurrentExpandCollapseState, state))
+        except Exception as e:
+            return sent_but_errored(method, e)
+        return (method, wait_for(lambda: ec.CurrentExpandCollapseState, state))
 
+    # pywinauto 0.6.9 wrappers have no `iface_legacy_iaccessible` attribute, so until
+    # 2026-09-14 this step raised AttributeError, was caught, and never ran for any control.
+    # The pattern is only reachable through uia_defines. Edge's saved tab-group buttons are a
+    # real case that needs it: ExpandCollapse + default action "Press", and when the button
+    # reports itself as a leaf (state 3) the expand step above is skipped.
     try:
-        la = target.iface_legacy_iaccessible
+        la = uia_defs.get_elem_interface(target.element_info.element, "LegacyIAccessible")
+        action = la.CurrentDefaultAction
     except Exception:
-        la = None
-    if la is not None:
+        la, action = None, None
+    if la is not None and action:  # an empty default action means there is nothing to send
         try:
             la.DoDefaultAction()
-            return ("default action", False)
-        except Exception:
-            pass
+        except Exception as e:
+            return sent_but_errored(f"default action ({action})", e)
+        return (f"default action ({action})", False)
 
     return None
 
