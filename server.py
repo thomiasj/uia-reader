@@ -234,13 +234,21 @@ def read_window(title: str, max_depth: int = 40) -> str:
     return result + _sparse_tree_note(win, lines) + _browser_warning(win.window_text())
 
 
-def _find_elements(elem, name, control_type, exact_match, results, counter=None):
+def _find_elements(elem, name, control_type, exact_match, results, counter=None, seen=None):
     # counter has no depth/max_depth cap deliberately -- a match could legitimately be
     # very deep (e.g. inside a browser page), and unlike _dump this doesn't need to
     # bound *output size*, just total work. MAX_NODES alone (no depth cutoff) is the
     # right guard here.
+    #
+    # `seen` holds UIA runtime ids already visited. Without a depth cap, a tree that loops
+    # back on itself (Chromium's can, transiently) would reach the same control again and
+    # again until MAX_NODES. Real use hit "39 elements matched" on 2026-09-13 for a button
+    # find_in_window showed exactly once; not reproducible at rest, so this guards the
+    # plausible cause and the listing below shows ids so a repeat would be diagnosable.
     if counter is None:
         counter = [0]
+    if seen is None:
+        seen = set()
     if counter[0] >= MAX_NODES:
         return
     counter[0] += 1
@@ -249,8 +257,13 @@ def _find_elements(elem, name, control_type, exact_match, results, counter=None)
         info = elem.element_info
         elem_name = _norm(info.name)
         elem_type = info.control_type
+        rid = tuple(info.runtime_id or ())
     except Exception:
         return
+    if rid:
+        if rid in seen:
+            return
+        seen.add(rid)
 
     name_ok = True
     if name is not None:
@@ -265,7 +278,7 @@ def _find_elements(elem, name, control_type, exact_match, results, counter=None)
 
     try:
         for child in elem.children():
-            _find_elements(child, name, control_type, exact_match, results, counter)
+            _find_elements(child, name, control_type, exact_match, results, counter, seen)
             if counter[0] >= MAX_NODES:
                 return
     except Exception:
@@ -352,8 +365,16 @@ def _resolve_target(title, name, control_type, exact_match, index):
         return matches[index], None
 
     if len(matches) > 1:
+        def where(m):
+            # Id and position tell "several different controls" apart from "one control
+            # reached several ways" -- the names alone can be byte-identical either way.
+            try:
+                r = m.element_info.rectangle
+                return f" id={'.'.join(map(str, m.element_info.runtime_id or ()))} at ({r.left},{r.top})"
+            except Exception:
+                return ""
         listing = "\n".join(
-            f"  [{i}] {m.element_info.control_type} '{m.element_info.name}'"
+            f"  [{i}] {m.element_info.control_type} '{m.element_info.name}'{where(m)}"
             for i, m in enumerate(matches)
         )
         return None, (
